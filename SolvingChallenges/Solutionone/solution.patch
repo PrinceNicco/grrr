@@ -1,0 +1,259 @@
+diff --git a/packages/prompts/src/index.ts b/packages/prompts/src/index.ts
+index dd82aee..272c29a 100644
+--- a/packages/prompts/src/index.ts
++++ b/packages/prompts/src/index.ts
+@@ -11,6 +11,7 @@ export * from './log.js';
+ export * from './messages.js';
+ export * from './multi-select.js';
+ export * from './note.js';
++export * from './parallel-tasks.js';
+ export * from './password.js';
+ export * from './path.js';
+ export * from './progress-bar.js';
+diff --git a/packages/prompts/src/parallel-tasks.ts b/packages/prompts/src/parallel-tasks.ts
+new file mode 100644
+index 0000000..602e77e
+--- /dev/null
++++ b/packages/prompts/src/parallel-tasks.ts
+@@ -0,0 +1,241 @@
++import type { CommonOptions } from './common.js';
++
++interface ParallelTaskResultSuccess<T> {
++	status: 'success';
++	value: T;
++}
++
++interface ParallelTaskResultError {
++	status: 'error';
++	error: unknown;
++}
++
++interface ParallelTaskResultPending {
++	status: 'pending';
++}
++
++interface ParallelTaskResultSkipped {
++	status: 'skipped';
++}
++
++export type ParallelTaskResult<T> =
++	| ParallelTaskResultSuccess<T>
++	| ParallelTaskResultError
++	| ParallelTaskResultPending
++	| ParallelTaskResultSkipped;
++
++export interface ParallelTask<T = unknown> {
++	title: string;
++	task: () => T | Promise<T>;
++	enabled?: boolean;
++}
++
++export interface ParallelTasksOptions extends CommonOptions {
++	concurrency?: number | (() => number);
++	stopOnError?: boolean;
++	onTaskComplete?: (index: number, result: ParallelTaskResult<unknown>) => void;
++}
++
++const enum SchedulerState {
++	Idle = 0,
++	Running = 1,
++	Halted = 2,
++	Completed = 3,
++}
++
++const SCHEDULER_TICK_INTERVAL = 10;
++
++class TaskScheduler<T> {
++	private readonly tasks: readonly ParallelTask<T>[];
++	private readonly results: ParallelTaskResult<T>[];
++	private readonly concurrencyProvider: () => number;
++	private readonly stopOnError: boolean;
++	private readonly onTaskComplete: ((index: number, result: ParallelTaskResult<unknown>) => void) | undefined;
++
++	private nextIndex = 0;
++	private activeCount = 0;
++	private state: SchedulerState = SchedulerState.Idle;
++	private readonly pendingPromises: Set<Promise<void>> = new Set();
++
++	constructor(
++		tasks: readonly ParallelTask<T>[],
++		concurrency: number | (() => number),
++		stopOnError: boolean,
++		onTaskComplete: ((index: number, result: ParallelTaskResult<unknown>) => void) | undefined
++	) {
++		this.tasks = tasks;
++		this.concurrencyProvider =
++			typeof concurrency === 'function' ? concurrency : () => concurrency;
++		this.stopOnError = stopOnError;
++		this.onTaskComplete = onTaskComplete;
++
++		const len = tasks.length;
++		this.results = new Array<ParallelTaskResult<T>>(len);
++		for (let i = 0; i < len; i++) {
++			this.results[i] = { status: 'pending' };
++		}
++	}
++
++	run(): Promise<ParallelTaskResult<T>[]> {
++		const taskCount = this.tasks.length;
++		if (taskCount === 0) {
++			return Promise.resolve([]);
++		}
++
++		this.state = SchedulerState.Running;
++
++		return new Promise<ParallelTaskResult<T>[]>((resolve) => {
++			const tick = (): void => {
++				if (this.state === SchedulerState.Completed) {
++					resolve(this.results);
++					return;
++				}
++
++				this.scheduleAvailableTasks();
++				this.checkCompletion();
++
++				if (this.state !== SchedulerState.Completed) {
++					setTimeout(tick, SCHEDULER_TICK_INTERVAL);
++				} else {
++					resolve(this.results);
++				}
++			};
++
++			this.scheduleAvailableTasks();
++			this.checkCompletion();
++
++			if (this.state === SchedulerState.Completed) {
++				resolve(this.results);
++			} else {
++				setTimeout(tick, SCHEDULER_TICK_INTERVAL);
++			}
++		});
++	}
++
++	private scheduleAvailableTasks(): void {
++		if (this.state === SchedulerState.Halted) {
++			return;
++		}
++
++		this.processDisabledTasks();
++
++		const taskCount = this.tasks.length;
++
++		while (this.nextIndex < taskCount && this.state === SchedulerState.Running) {
++			const limit = this.concurrencyProvider();
++
++			if (limit <= 0 || this.activeCount >= limit) {
++				break;
++			}
++
++			const task = this.tasks[this.nextIndex];
++
++			if (task.enabled === false) {
++				this.markSkipped(this.nextIndex);
++				this.nextIndex++;
++				continue;
++			}
++
++			const currentIndex = this.nextIndex;
++			this.nextIndex++;
++			this.dispatchTask(currentIndex, task);
++		}
++	}
++
++	private processDisabledTasks(): void {
++		const taskCount = this.tasks.length;
++
++		while (this.nextIndex < taskCount) {
++			const task = this.tasks[this.nextIndex];
++			if (task.enabled !== false) {
++				break;
++			}
++			this.markSkipped(this.nextIndex);
++			this.nextIndex++;
++		}
++	}
++
++	private dispatchTask(index: number, task: ParallelTask<T>): void {
++		this.activeCount++;
++
++		const execution = this.executeTaskSafe(index, task);
++		this.pendingPromises.add(execution);
++
++		execution.finally(() => {
++			this.pendingPromises.delete(execution);
++		});
++	}
++
++	private async executeTaskSafe(index: number, task: ParallelTask<T>): Promise<void> {
++		try {
++			const value = await Promise.resolve().then(() => task.task());
++			this.recordSuccess(index, value);
++		} catch (error: unknown) {
++			this.recordError(index, error);
++		} finally {
++			this.activeCount--;
++		}
++	}
++
++	private recordSuccess(index: number, value: T): void {
++		const result: ParallelTaskResultSuccess<T> = { status: 'success', value };
++		this.results[index] = result;
++		this.invokeCallback(index, result);
++	}
++
++	private recordError(index: number, error: unknown): void {
++		const result: ParallelTaskResultError = { status: 'error', error };
++		this.results[index] = result;
++
++		if (this.stopOnError) {
++			this.state = SchedulerState.Halted;
++		}
++
++		this.invokeCallback(index, result);
++	}
++
++	private markSkipped(index: number): void {
++		const result: ParallelTaskResultSkipped = { status: 'skipped' };
++		this.results[index] = result;
++		this.invokeCallback(index, result);
++	}
++
++	private invokeCallback(index: number, result: ParallelTaskResult<T>): void {
++		if (this.onTaskComplete === undefined) {
++			return;
++		}
++		try {
++			this.onTaskComplete(index, result);
++		} catch {
++			// Callback errors are swallowed per specification
++		}
++	}
++
++	private checkCompletion(): void {
++		const allScheduled = this.nextIndex >= this.tasks.length;
++		const noneActive = this.activeCount === 0;
++
++		if (allScheduled && noneActive) {
++			this.state = SchedulerState.Completed;
++			return;
++		}
++
++		if (this.state === SchedulerState.Halted && noneActive) {
++			this.state = SchedulerState.Completed;
++		}
++	}
++}
++
++export async function parallelTasks<T>(
++	tasks: ParallelTask<T>[],
++	opts: ParallelTasksOptions = {}
++): Promise<ParallelTaskResult<T>[]> {
++	const {
++		concurrency = Number.POSITIVE_INFINITY,
++		stopOnError = true,
++		onTaskComplete,
++	} = opts;
++
++	const scheduler = new TaskScheduler<T>(tasks, concurrency, stopOnError, onTaskComplete);
++	return scheduler.run();
++}
