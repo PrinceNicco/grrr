@@ -1,0 +1,218 @@
+diff --git a/packages/prompts/src/parallel-tasks.ts b/packages/prompts/src/parallel-tasks.ts
+new file mode 100644
+index 0000000..ee933a8
+--- /dev/null
++++ b/packages/prompts/src/parallel-tasks.ts
+@@ -0,0 +1,200 @@
++import type { CommonOptions } from './common.js';
++
++export interface ParallelTask<T = unknown> {
++	title: string;
++	task: () => T | Promise<T>;
++	enabled?: boolean;
++}
++
++export type ParallelTaskResultSuccess<T> = {
++	status: 'success';
++	value: T;
++};
++
++export type ParallelTaskResultError = {
++	status: 'error';
++	error: unknown;
++};
++
++export type ParallelTaskResultPending = {
++	status: 'pending';
++};
++
++export type ParallelTaskResultSkipped = {
++	status: 'skipped';
++};
++
++export type ParallelTaskResult<T> =
++	| ParallelTaskResultSuccess<T>
++	| ParallelTaskResultError
++	| ParallelTaskResultPending
++	| ParallelTaskResultSkipped;
++
++export interface ParallelTasksOptions extends CommonOptions {
++	concurrency?: number | (() => number);
++	stopOnError?: boolean;
++	onTaskComplete?: (index: number, result: ParallelTaskResult<unknown>) => void;
++}
++
++type ConcurrencyProvider = () => number;
++
++type SchedulerState = {
++	activeCount: number;
++	nextIndex: number;
++	hasError: boolean;
++};
++
++const SCHEDULER_TICK_MS = 10;
++
++const createResultFactory = <T>() => ({
++	success: (value: T): ParallelTaskResultSuccess<T> => ({ status: 'success', value }),
++	error: (error: unknown): ParallelTaskResultError => ({ status: 'error', error }),
++	pending: (): ParallelTaskResultPending => ({ status: 'pending' }),
++	skipped: (): ParallelTaskResultSkipped => ({ status: 'skipped' }),
++});
++
++const createSchedulerGuards = (
++	state: SchedulerState,
++	taskCount: number,
++	stopOnError: boolean,
++	getConcurrency: ConcurrencyProvider
++) => ({
++	shouldHalt: (): boolean => state.hasError && stopOnError,
++	hasRemainingTasks: (): boolean => state.nextIndex < taskCount,
++	canAcquireSlot: (): boolean => {
++		const limit = getConcurrency();
++		return limit > 0 && state.activeCount < limit;
++	},
++	shouldYield: (): boolean => {
++		if (state.hasError && stopOnError) return false;
++		if (state.nextIndex >= taskCount) return false;
++		return true;
++	},
++});
++
++const safeInvoke = <TArgs extends unknown[], TRet>(
++	fn: ((...args: TArgs) => TRet) | undefined,
++	...args: TArgs
++): TRet | undefined => {
++	if (typeof fn !== 'function') return undefined;
++	try {
++		return fn(...args);
++	} catch {
++		return undefined;
++	}
++};
++
++const createTaskExecutor = <T>(
++	results: ParallelTaskResult<T>[],
++	state: SchedulerState,
++	resultFactory: ReturnType<typeof createResultFactory<T>>,
++	onComplete?: (index: number, result: ParallelTaskResult<unknown>) => void
++) => {
++	const notifyCompletion = (index: number, result: ParallelTaskResult<T>): void => {
++		safeInvoke(onComplete, index, result);
++	};
++
++	const markSkipped = (index: number): void => {
++		const result = resultFactory.skipped();
++		results[index] = result;
++		notifyCompletion(index, result);
++	};
++
++	const execute = async (index: number, taskFn: () => T | Promise<T>): Promise<void> => {
++		state.activeCount++;
++		try {
++			const value = await Promise.resolve().then(taskFn);
++			const result = resultFactory.success(value);
++			results[index] = result;
++			notifyCompletion(index, result);
++		} catch (err: unknown) {
++			const result = resultFactory.error(err);
++			results[index] = result;
++			state.hasError = true;
++			notifyCompletion(index, result);
++		} finally {
++			state.activeCount--;
++		}
++	};
++
++	return { execute, markSkipped };
++};
++
++const createAsyncScheduler = (tickMs: number) => ({
++	tick: (): Promise<void> => new Promise((r) => setTimeout(r, tickMs)),
++});
++
++export async function parallelTasks<T>(
++	taskDefinitions: readonly ParallelTask<T>[],
++	opts: ParallelTasksOptions = {}
++): Promise<ParallelTaskResult<T>[]> {
++	const {
++		concurrency = Number.POSITIVE_INFINITY,
++		stopOnError = true,
++		onTaskComplete,
++	} = opts;
++
++	const taskCount = taskDefinitions.length;
++	if (taskCount === 0) return [];
++
++	const resultFactory = createResultFactory<T>();
++	const results: ParallelTaskResult<T>[] = Array.from(
++		{ length: taskCount },
++		resultFactory.pending
++	);
++
++	const state: SchedulerState = {
++		activeCount: 0,
++		nextIndex: 0,
++		hasError: false,
++	};
++
++	const getConcurrency: ConcurrencyProvider =
++		typeof concurrency === 'function' ? concurrency : () => concurrency;
++
++	const guards = createSchedulerGuards(state, taskCount, stopOnError, getConcurrency);
++	const executor = createTaskExecutor(results, state, resultFactory, onTaskComplete);
++	const scheduler = createAsyncScheduler(SCHEDULER_TICK_MS);
++
++	const processDisabledPrefix = (): void => {
++		while (state.nextIndex < taskCount) {
++			const def = taskDefinitions[state.nextIndex];
++			if (def.enabled !== false) break;
++			executor.markSkipped(state.nextIndex);
++			state.nextIndex++;
++		}
++	};
++
++	const inflight: Promise<void>[] = [];
++
++	const runSchedulerLoop = async (): Promise<void> => {
++		while (true) {
++			processDisabledPrefix();
++
++			if (!guards.hasRemainingTasks()) break;
++			if (guards.shouldHalt()) break;
++
++			if (guards.canAcquireSlot()) {
++				const idx = state.nextIndex;
++				const def = taskDefinitions[idx];
++				state.nextIndex++;
++
++				if (def.enabled === false) {
++					executor.markSkipped(idx);
++					continue;
++				}
++
++				inflight.push(executor.execute(idx, def.task));
++				continue;
++			}
++
++			if (!guards.shouldYield()) break;
++			await scheduler.tick();
++		}
++	};
++
++	await runSchedulerLoop();
++	await Promise.all(inflight);
++
++	return results;
++}
+diff --git a/packages/prompts/src/index.ts b/packages/prompts/src/index.ts
+index dd82aee..272c29a 100644
+--- a/packages/prompts/src/index.ts
++++ b/packages/prompts/src/index.ts
+@@ -11,6 +11,7 @@ export * from './log.js';
+ export * from './messages.js';
+ export * from './multi-select.js';
+ export * from './note.js';
++export * from './parallel-tasks.js';
+ export * from './password.js';
+ export * from './path.js';
+ export * from './progress-bar.js';
